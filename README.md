@@ -23,7 +23,8 @@ go build ./cmd/github-workflow-mcp
 github-workflow-mcp \
   --addr 127.0.0.1:39091 \
   --github-workflow-bin /path/to/github-workflow \
-  --registry-dir /path/to/project/github-workflow-registry
+  --registry-dir /path/to/project/github-workflow-registry \
+  --sync-interval 15m
 ```
 
 Then create a custom MCP external tool in Multigent:
@@ -36,7 +37,8 @@ MCP Server URL: http://127.0.0.1:39091/mcp
 If Multigent API and this MCP server are on different machines, use an intranet
 URL reachable by the API server and configure `--token`.
 
-`github_workflow.sync` starts a background refresh and returns immediately.
-Use `github_workflow.sync_status` to check whether the last refresh is still
-running, completed, or failed. This keeps agent wakeups from blocking on slow
-GitHub metadata syncs.
+The MCP server owns GitHub metadata refresh. It starts a background sync on
+startup and repeats it on `--sync-interval`; use `--sync-interval 0` to disable
+that loop. Agents should not call sync directly. They read cached registry data
+through inbox/show tools, and may call `github_workflow.sync_status` to check
+freshness.

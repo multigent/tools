@@ -18,18 +18,20 @@ import (
 )
 
 const (
-	defaultAddr    = "127.0.0.1:39091"
-	defaultTimeout = 180 * time.Second
-	maxBodyBytes   = 1 << 20
+	defaultAddr         = "127.0.0.1:39091"
+	defaultTimeout      = 10 * time.Minute
+	defaultSyncInterval = 15 * time.Minute
+	maxBodyBytes        = 1 << 20
 )
 
 type server struct {
-	bin         string
-	registryDir string
-	token       string
-	timeout     time.Duration
-	syncMu      sync.Mutex
-	syncState   syncJobState
+	bin          string
+	registryDir  string
+	token        string
+	timeout      time.Duration
+	syncInterval time.Duration
+	syncMu       sync.Mutex
+	syncState    syncJobState
 }
 
 type syncJobState struct {
@@ -73,21 +75,28 @@ func main() {
 	registryDir := flag.String("registry-dir", getenv("GITHUB_WORKFLOW_REGISTRY", ""), "github-workflow registry directory")
 	token := flag.String("token", getenv("GITHUB_WORKFLOW_MCP_TOKEN", ""), "optional bearer token required from callers")
 	timeoutText := flag.String("timeout", getenv("GITHUB_WORKFLOW_MCP_TIMEOUT", defaultTimeout.String()), "per command timeout")
+	syncIntervalText := flag.String("sync-interval", getenv("GITHUB_WORKFLOW_MCP_SYNC_INTERVAL", defaultSyncInterval.String()), "background sync interval; set 0 to disable")
 	flag.Parse()
 
 	timeout, err := time.ParseDuration(*timeoutText)
 	if err != nil {
 		log.Fatalf("invalid --timeout: %v", err)
 	}
+	syncInterval, err := time.ParseDuration(*syncIntervalText)
+	if err != nil {
+		log.Fatalf("invalid --sync-interval: %v", err)
+	}
 	if strings.TrimSpace(*registryDir) == "" {
 		log.Fatalf("--registry-dir is required")
 	}
 	s := &server{
-		bin:         strings.TrimSpace(*bin),
-		registryDir: strings.TrimSpace(*registryDir),
-		token:       strings.TrimSpace(*token),
-		timeout:     timeout,
+		bin:          strings.TrimSpace(*bin),
+		registryDir:  strings.TrimSpace(*registryDir),
+		token:        strings.TrimSpace(*token),
+		timeout:      timeout,
+		syncInterval: syncInterval,
 	}
+	s.startBackgroundSync()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -169,12 +178,8 @@ func (s *server) callTool(ctx context.Context, name string, args map[string]any)
 		args = map[string]any{}
 	}
 	switch name {
-	case "github_workflow.sync":
-		return s.startSync()
 	case "github_workflow.sync_status":
 		return s.syncStatus()
-	case "github_workflow.render_all":
-		return s.run(ctx, "render", "--all")
 	case "github_workflow.issue_inbox":
 		return s.run(ctx, "issue", "inbox", "--view", stringArg(args, "view", "pm"))
 	case "github_workflow.issue_show":
@@ -208,12 +213,27 @@ func (s *server) callTool(ctx context.Context, name string, args map[string]any)
 	}
 }
 
-func (s *server) startSync() (string, error) {
+func (s *server) startBackgroundSync() {
+	if s.syncInterval <= 0 {
+		log.Printf("github-workflow background sync disabled")
+		return
+	}
+	s.startSync("startup")
+	go func() {
+		ticker := time.NewTicker(s.syncInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.startSync("scheduled")
+		}
+	}()
+}
+
+func (s *server) startSync(reason string) {
 	s.syncMu.Lock()
 	if s.syncState.Running {
-		state := s.syncState
 		s.syncMu.Unlock()
-		return fmt.Sprintf("sync already running since %s", state.LastStart.Format(time.RFC3339)), nil
+		log.Printf("github-workflow sync skipped: already running")
+		return
 	}
 	s.syncState.Running = true
 	s.syncState.LastStart = time.Now()
@@ -223,7 +243,15 @@ func (s *server) startSync() (string, error) {
 	s.syncMu.Unlock()
 
 	go func() {
+		log.Printf("github-workflow sync started reason=%s", reason)
 		out, err := s.run(context.Background(), "sync")
+		if err == nil {
+			if renderOut, renderErr := s.run(context.Background(), "render", "--all"); renderErr != nil {
+				err = fmt.Errorf("render after sync failed: %w", renderErr)
+			} else if strings.TrimSpace(renderOut) != "" {
+				out = strings.TrimSpace(out + "\n" + renderOut)
+			}
+		}
 		s.syncMu.Lock()
 		defer s.syncMu.Unlock()
 		s.syncState.Running = false
@@ -236,8 +264,6 @@ func (s *server) startSync() (string, error) {
 		}
 		log.Printf("github-workflow sync completed")
 	}()
-
-	return "sync started in background; use github_workflow.sync_status to check completion", nil
 }
 
 func (s *server) syncStatus() (string, error) {
@@ -323,9 +349,7 @@ func prSetArgs(args map[string]any) ([]string, error) {
 
 func tools() []toolDef {
 	return []toolDef{
-		{Name: "github_workflow.sync", Description: "Start a background refresh of open GitHub issue and PR metadata into the workflow registry.", InputSchema: objectSchema(nil, nil)},
 		{Name: "github_workflow.sync_status", Description: "Show the current or last GitHub workflow sync status.", InputSchema: objectSchema(nil, nil)},
-		{Name: "github_workflow.render_all", Description: "Regenerate all Markdown issue and PR views from the workflow registry.", InputSchema: objectSchema(nil, nil)},
 		{Name: "github_workflow.issue_inbox", Description: "List issues for a workflow view. PM should normally use view=pm.", InputSchema: objectSchema(map[string]any{"view": enumStringSchema("Issue view.", []string{"pm", "unanswered", "false-complete", "all", "new", "needs-info", "waiting-human", "has-pr", "assigned", "release-blocker", "stale"})}, nil)},
 		{Name: "github_workflow.issue_show", Description: "Show one tracked issue record as JSON.", InputSchema: objectSchema(map[string]any{"number": integerSchema("GitHub issue number.")}, []string{"number"})},
 		{Name: "github_workflow.issue_set", Description: "Update issue workflow fields in the registry. Normal PM triage should comment on GitHub before marking progress.", InputSchema: objectSchema(map[string]any{"number": integerSchema("GitHub issue number."), "workflow_state": stringSchema("Workflow state, for example assigned, needs-info, has-pr, waiting-human."), "triage": stringSchema("Triage category, for example bug-dev, answer-now, needs-repro, has-pr, owner-decision."), "priority": integerSchema("Priority 0-3."), "owner_agent": stringSchema("Owning PM/support agent id."), "assigned_agent": stringSchema("Assigned downstream agent id."), "waiting_on": stringSchema("Who the issue is waiting on: user, dev, qa, human, none."), "linked_prs": listSchema("Linked PR numbers."), "linked_tasks": listSchema("Linked Multigent task ids."), "notes": stringSchema("Short workflow notes."), "allow_registry_only": boolSchema("Override the GitHub reply guard. Use only for exceptional registry maintenance.")}, []string{"number"})},
