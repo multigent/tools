@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,16 @@ type server struct {
 	registryDir string
 	token       string
 	timeout     time.Duration
+	syncMu      sync.Mutex
+	syncState   syncJobState
+}
+
+type syncJobState struct {
+	Running    bool      `json:"running"`
+	LastStart  time.Time `json:"lastStart,omitempty"`
+	LastFinish time.Time `json:"lastFinish,omitempty"`
+	LastOutput string    `json:"lastOutput,omitempty"`
+	LastError  string    `json:"lastError,omitempty"`
 }
 
 type rpcRequest struct {
@@ -71,7 +82,7 @@ func main() {
 	if strings.TrimSpace(*registryDir) == "" {
 		log.Fatalf("--registry-dir is required")
 	}
-	s := server{
+	s := &server{
 		bin:         strings.TrimSpace(*bin),
 		registryDir: strings.TrimSpace(*registryDir),
 		token:       strings.TrimSpace(*token),
@@ -86,7 +97,7 @@ func main() {
 	}
 }
 
-func (s server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -98,7 +109,7 @@ func (s server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s server) handleMCP(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -137,7 +148,7 @@ func (s server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s server) handleToolCall(w http.ResponseWriter, r *http.Request, req rpcRequest) {
+func (s *server) handleToolCall(w http.ResponseWriter, r *http.Request, req rpcRequest) {
 	var params toolCallParams
 	if len(req.Params) > 0 {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -153,13 +164,15 @@ func (s server) handleToolCall(w http.ResponseWriter, r *http.Request, req rpcRe
 	writeRPCResult(w, req.ID, toolResult{Content: []map[string]any{{"type": "text", "text": out}}})
 }
 
-func (s server) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
+func (s *server) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
 	switch name {
 	case "github_workflow.sync":
-		return s.run(ctx, "sync")
+		return s.startSync()
+	case "github_workflow.sync_status":
+		return s.syncStatus()
 	case "github_workflow.render_all":
 		return s.run(ctx, "render", "--all")
 	case "github_workflow.issue_inbox":
@@ -195,7 +208,50 @@ func (s server) callTool(ctx context.Context, name string, args map[string]any) 
 	}
 }
 
-func (s server) run(ctx context.Context, args ...string) (string, error) {
+func (s *server) startSync() (string, error) {
+	s.syncMu.Lock()
+	if s.syncState.Running {
+		state := s.syncState
+		s.syncMu.Unlock()
+		return fmt.Sprintf("sync already running since %s", state.LastStart.Format(time.RFC3339)), nil
+	}
+	s.syncState.Running = true
+	s.syncState.LastStart = time.Now()
+	s.syncState.LastFinish = time.Time{}
+	s.syncState.LastOutput = ""
+	s.syncState.LastError = ""
+	s.syncMu.Unlock()
+
+	go func() {
+		out, err := s.run(context.Background(), "sync")
+		s.syncMu.Lock()
+		defer s.syncMu.Unlock()
+		s.syncState.Running = false
+		s.syncState.LastFinish = time.Now()
+		s.syncState.LastOutput = out
+		if err != nil {
+			s.syncState.LastError = err.Error()
+			log.Printf("github-workflow sync failed: %v", err)
+			return
+		}
+		log.Printf("github-workflow sync completed")
+	}()
+
+	return "sync started in background; use github_workflow.sync_status to check completion", nil
+}
+
+func (s *server) syncStatus() (string, error) {
+	s.syncMu.Lock()
+	state := s.syncState
+	s.syncMu.Unlock()
+	body, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func (s *server) run(ctx context.Context, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 	fullArgs := append([]string{"--registry-dir", s.registryDir}, args...)
@@ -267,7 +323,8 @@ func prSetArgs(args map[string]any) ([]string, error) {
 
 func tools() []toolDef {
 	return []toolDef{
-		{Name: "github_workflow.sync", Description: "Refresh open GitHub issue and PR metadata into the workflow registry.", InputSchema: objectSchema(nil, nil)},
+		{Name: "github_workflow.sync", Description: "Start a background refresh of open GitHub issue and PR metadata into the workflow registry.", InputSchema: objectSchema(nil, nil)},
+		{Name: "github_workflow.sync_status", Description: "Show the current or last GitHub workflow sync status.", InputSchema: objectSchema(nil, nil)},
 		{Name: "github_workflow.render_all", Description: "Regenerate all Markdown issue and PR views from the workflow registry.", InputSchema: objectSchema(nil, nil)},
 		{Name: "github_workflow.issue_inbox", Description: "List issues for a workflow view. PM should normally use view=pm.", InputSchema: objectSchema(map[string]any{"view": enumStringSchema("Issue view.", []string{"pm", "unanswered", "false-complete", "all", "new", "needs-info", "waiting-human", "has-pr", "assigned", "release-blocker", "stale"})}, nil)},
 		{Name: "github_workflow.issue_show", Description: "Show one tracked issue record as JSON.", InputSchema: objectSchema(map[string]any{"number": integerSchema("GitHub issue number.")}, []string{"number"})},
